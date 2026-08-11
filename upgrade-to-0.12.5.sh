@@ -21,7 +21,7 @@
 set -euo pipefail
 
 TOOL_NAME="evejs-upgrade"
-TOOL_VERSION="1.0.0"
+TOOL_VERSION="1.0.1"
 TARGET_VERSION="0.12.5"
 
 log()  { printf '%s\n' "$*"; }
@@ -490,29 +490,58 @@ write_lan_compose_if_missing() {
   return 0
 }
 
+# EveJS 0.12.5+ serves character portraits from the Docker volume
+# (gameStore/images/Character/), not only the source-tree legacy path
+# server/src/_secondary/image/generated/Character/. Without this copy,
+# character-select JPGs (including TQ-import portraits) go blank after upgrade.
 migrate_portraits_to_volume() {
   local volume="$1"
+  local bak="${2:-}"
   local char_src="${ROOT}/server/src/_secondary/image/generated/Character"
   local all_src="${ROOT}/server/src/_secondary/image/generated/Alliance"
+  local n
+
+  # Prefer restored host tree; fall back to pre-upgrade backup if empty
+  n="$(find "${char_src}" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${n}" -eq 0 && -n "${bak}" ]]; then
+    local bak_char="${bak}/server/src/_secondary/image/generated/Character"
+    if [[ -d "${bak_char}" ]] && [[ "$(find "${bak_char}" -type f 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]]; then
+      mkdir -p "${char_src}"
+      cp -a "${bak_char}/." "${char_src}/"
+      n="$(find "${char_src}" -type f 2>/dev/null | wc -l | tr -d ' ')"
+      ok "restored ${n} portrait file(s) from tree backup → generated/Character"
+    fi
+  fi
+
   if ! docker volume inspect "${volume}" >/dev/null 2>&1; then
-    warn "volume ${volume} not found yet — portraits will use host legacy path after start"
+    warn "volume ${volume} not found yet — portraits stay on host legacy path only"
     return 0
   fi
-  if [[ -d "${char_src}" ]] && [[ "$(find "${char_src}" -type f 2>/dev/null | wc -l)" -gt 0 ]]; then
-    info "copying character portraits into volume ${volume}…"
+
+  if [[ -d "${char_src}" ]] && [[ "${n}" -gt 0 ]]; then
+    info "copying ${n} character portrait file(s) into volume ${volume} (0.12.5 runtime path)…"
     docker run --rm \
       -v "${volume}:/data" \
       -v "${char_src}:/portraits:ro" \
-      alpine sh -c 'mkdir -p /data/gameStore/images/Character && cp -a /portraits/. /data/gameStore/images/Character/ && echo "Character files: $(find /data/gameStore/images/Character -type f | wc -l)"'
-    ok "character portraits in volume"
+      alpine sh -c '
+        mkdir -p /data/gameStore/images/Character
+        cp -a /portraits/. /data/gameStore/images/Character/
+        echo "volume Character files: $(find /data/gameStore/images/Character -type f | wc -l)"
+      '
+    ok "character portraits in volume: gameStore/images/Character/"
   else
-    warn "no legacy Character portraits found under generated/Character"
+    warn "no Character portrait JPGs found under generated/Character (import/TQ portraits may need re-run)"
   fi
-  if [[ -d "${all_src}" ]] && [[ "$(find "${all_src}" -type f 2>/dev/null | wc -l)" -gt 0 ]]; then
+
+  if [[ -d "${all_src}" ]] && [[ "$(find "${all_src}" -type f 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]]; then
     docker run --rm \
       -v "${volume}:/data" \
       -v "${all_src}:/logos:ro" \
-      alpine sh -c 'mkdir -p /data/gameStore/images/Alliance && cp -a /logos/. /data/gameStore/images/Alliance/ && echo "Alliance files: $(find /data/gameStore/images/Alliance -type f | wc -l)"'
+      alpine sh -c '
+        mkdir -p /data/gameStore/images/Alliance
+        cp -a /logos/. /data/gameStore/images/Alliance/
+        echo "volume Alliance files: $(find /data/gameStore/images/Alliance -type f | wc -l)"
+      '
     ok "alliance logos in volume"
   fi
 }
@@ -656,9 +685,9 @@ EOF
   patch_compose_continuity "${project}" "${volume}"
   apply_timers
 
-  # Portraits → volume (0.12.5 runtime location)
-  header "Migrate portraits into data volume"
-  migrate_portraits_to_volume "${volume}"
+  # Portraits → volume (0.12.5 runtime location; fixes blank character-select JPGs)
+  header "Migrate character portraits into data volume"
+  migrate_portraits_to_volume "${volume}" "${bak}"
 
   # Notes
   cat > "${ROOT}/_local/UPGRADE-${TARGET_VERSION}.md" <<EOF

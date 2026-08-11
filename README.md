@@ -35,7 +35,7 @@ Auto-detect zip/folder (Downloads, Desktop, cwd):
 | Preserve | Certs, `_local/`, custom tools, LAN compose, character/alliance images |
 | Volume | Reuses your existing Docker data volume (characters/accounts/market) |
 | Timers | By default keeps fast skill + structure timers if found (or 3600 / 0.01) |
-| Portraits | Copies legacy `generated/Character` into `gameStore/images/` on the volume |
+| Portraits | **Required on 0.12.5:** copies legacy `generated/Character` JPGs (incl. TQ-import faces) into the Docker volume at `gameStore/images/Character/`, and bind-mounts the legacy Character folder so character select is not blank |
 | Build/start | Rebuilds image and starts the stack |
 
 **Living Universe / X-Eve code is not in stock 0.12.5** — the upgrade removes it

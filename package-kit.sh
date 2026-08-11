@@ -9,7 +9,7 @@ if [[ -n "${ROOT}" && -f "${ROOT}/compose.yaml" ]]; then
 else
   DIST="${SCRIPT_DIR}/dist"
 fi
-VERSION="${EVEJS_UPGRADE_VERSION:-1.0.0}"
+VERSION="${EVEJS_UPGRADE_VERSION:-1.0.1}"
 NAME="evejs-upgrade-v${VERSION}"
 STAGE="${DIST}/.stage-${NAME}"
 
