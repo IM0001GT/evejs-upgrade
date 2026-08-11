@@ -15,13 +15,14 @@
 #   - creates a universe snapshot if tools/server-snapshot is present
 #   - reuses the existing Docker data volume (accounts/characters/market)
 #   - copies certs, _local/, custom tools, LAN override, and character portraits
+#   - restores faces for TQ-imported characters only (not pure local-created alts)
 #   - drops X-Eve / Living Universe code (not present in stock 0.12.5)
 #   - optionally keeps solo skill/structure timers from the old install
 #
 set -euo pipefail
 
 TOOL_NAME="evejs-upgrade"
-TOOL_VERSION="1.0.1"
+TOOL_VERSION="1.1.0"
 TARGET_VERSION="0.12.5"
 
 log()  { printf '%s\n' "$*"; }
@@ -47,6 +48,8 @@ UPWELL_SCALE=""
 DO_BUILD=1
 DO_START=1
 DO_SNAPSHOT=1
+RESTORE_PORTRAITS=1
+FORCE_PORTRAIT_DOWNLOAD=0
 DRY_RUN=0
 ASSUME_YES=0
 BACKUP_PARENT=""
@@ -72,6 +75,9 @@ OPTIONS
   --skip-snapshot     Do not run tools/server-snapshot even if present
   --skip-build        Do not docker compose build
   --skip-start        Do not docker compose up after upgrade
+  --restore-portraits Restore TQ-imported character faces (default: on)
+  --skip-restore-portraits  Do not re-download/sync imported character JPGs
+  --force-portrait-download Re-download faces even if host JPGs exist
   --yes               Non-interactive (required flags must still be valid)
   --dry-run           Print plan only
   -h, --help          This help
@@ -88,6 +94,7 @@ WHAT IS PRESERVED
   - tools/ you added (lan-play, server-snapshot, solo-rpg-preset, …) merged back
   - compose.lan.yaml if present
   - Character / Alliance images under generated/ and migrated into the volume
+  - Faces for characters that were imported from Tranquility (tqImport metadata)
 
 WHAT GOES AWAY
   - X-Eve / Living Universe / Family Estate server code (not in stock 0.12.5)
@@ -113,6 +120,9 @@ parse_args() {
       --skip-snapshot) DO_SNAPSHOT=0; shift ;;
       --skip-build) DO_BUILD=0; shift ;;
       --skip-start) DO_START=0; shift ;;
+      --restore-portraits) RESTORE_PORTRAITS=1; shift ;;
+      --skip-restore-portraits) RESTORE_PORTRAITS=0; shift ;;
+      --force-portrait-download) FORCE_PORTRAIT_DOWNLOAD=1; shift ;;
       --yes|-y) ASSUME_YES=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       -h|--help|help) usage; exit 0 ;;
@@ -546,6 +556,167 @@ migrate_portraits_to_volume() {
   fi
 }
 
+# Download missing portrait sizes for one character from images.evetech.net
+download_portrait_sizes() {
+  local local_id="$1" tq_id="$2" dest_dir="$3"
+  local size url dest
+  mkdir -p "${dest_dir}"
+  for size in 32 64 128 256 512 1024; do
+    dest="${dest_dir}/${local_id}_${size}.jpg"
+    if [[ "${FORCE_PORTRAIT_DOWNLOAD}" -ne 1 && -f "${dest}" && -s "${dest}" ]]; then
+      continue
+    fi
+    url="https://images.evetech.net/characters/${tq_id}/portrait?tenant=tranquility&size=${size}"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL --max-time 30 -A "evejs-upgrade/${TOOL_VERSION}" -o "${dest}.partial" "${url}" \
+        && mv "${dest}.partial" "${dest}" \
+        || rm -f "${dest}.partial"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q -O "${dest}.partial" "${url}" && mv "${dest}.partial" "${dest}" || rm -f "${dest}.partial"
+    fi
+  done
+}
+
+# Restore faces only for TQ-imported characters (not local-created alts).
+# Detection: character JSON must include tqImport.sourceCharacterID (>0).
+restore_imported_character_portraits() {
+  local volume="$1"
+  local project_name="${2:-evejs-xeve}"
+  local char_dir="${ROOT}/server/src/_secondary/image/generated/Character"
+
+  if [[ "${RESTORE_PORTRAITS}" -ne 1 ]]; then
+    info "portrait restore skipped (--skip-restore-portraits)"
+    return 0
+  fi
+
+  header "Restore portraits for TQ-imported characters only"
+
+  # Prefer the full tq-import tool when restored with the tree
+  if [[ -f "${ROOT}/tools/tq-import/tq-import.js" ]] && command -v node >/dev/null 2>&1; then
+    info "using tools/tq-import restore-portraits (skips characters without tqImport metadata)"
+    local -a extra=()
+    if [[ "${FORCE_PORTRAIT_DOWNLOAD}" -eq 1 ]]; then
+      extra+=(--force-download)
+    fi
+    if (cd "${ROOT}" && node tools/tq-import/tq-import.js restore-portraits "${extra[@]}" ); then
+      ok "tq-import restore-portraits finished"
+      return 0
+    fi
+    warn "tq-import restore-portraits failed — trying built-in restore"
+  fi
+
+  if ! docker volume inspect "${volume}" >/dev/null 2>&1; then
+    warn "volume ${volume} missing — cannot list imported characters"
+    return 0
+  fi
+
+  # Need an image with better-sqlite3 to read character rows
+  local pairs_json="[]"
+  local img
+  for img in "${project_name}-local" "evejs-xeve-local" "evejs-local"; do
+    if docker image inspect "${img}" >/dev/null 2>&1; then
+      pairs_json="$(
+        docker run --rm --user node \
+          -v "${volume}:/var/lib/evejs" \
+          -w /app/server \
+          "${img}" \
+          node -e '
+const Database = require("better-sqlite3");
+const db = new Database("/var/lib/evejs/gameStore/gamestore.sqlite", { readonly: true });
+const rows = db.prepare("SELECT key, json FROM characters").all();
+const out = [];
+for (const row of rows) {
+  let rec; try { rec = JSON.parse(row.json); } catch { continue; }
+  const tq = rec.tqImport && rec.tqImport.sourceCharacterID ? Number(rec.tqImport.sourceCharacterID) : 0;
+  if (!(tq > 0)) continue; // pure local-created characters: skip
+  out.push({ localCharacterID: Number(row.key), tqCharacterID: tq, characterName: rec.characterName || "" });
+}
+process.stdout.write(JSON.stringify(out));
+' 2>/dev/null || echo '[]'
+      )"
+      break
+    fi
+  done
+
+  local count
+  count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1] or "[]")))' "${pairs_json}" 2>/dev/null || echo 0)"
+  if [[ "${count}" -eq 0 ]]; then
+    info "no TQ-imported characters found (need tqImport.sourceCharacterID on the character row)"
+    info "local-created characters are left alone"
+    return 0
+  fi
+
+  ok "found ${count} TQ-imported character(s) — restoring faces (local-created alts skipped)"
+  mkdir -p "${char_dir}"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "${pairs_json}" "${char_dir}" "${FORCE_PORTRAIT_DOWNLOAD}" "${TOOL_VERSION}" <<'PY'
+import json, os, sys, urllib.request
+
+pairs = json.loads(sys.argv[1] or "[]")
+dest_dir = sys.argv[2]
+force = sys.argv[3] == "1"
+ver = sys.argv[4] if len(sys.argv) > 4 else "1.1.0"
+sizes = [32, 64, 128, 256, 512, 1024]
+os.makedirs(dest_dir, exist_ok=True)
+ua = f"evejs-upgrade/{ver}"
+
+for p in pairs:
+    local_id = int(p.get("localCharacterID") or 0)
+    tq_id = int(p.get("tqCharacterID") or 0)
+    name = p.get("characterName") or str(local_id)
+    if local_id <= 0 or tq_id <= 0:
+        continue
+    kept = 0
+    got = 0
+    for size in sizes:
+        path = os.path.join(dest_dir, f"{local_id}_{size}.jpg")
+        if not force and os.path.isfile(path) and os.path.getsize(path) > 100:
+            kept += 1
+            continue
+        url = f"https://images.evetech.net/characters/{tq_id}/portrait?tenant=tranquility&size={size}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "image/jpeg"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            if data and len(data) > 100:
+                with open(path, "wb") as f:
+                    f.write(data)
+                got += 1
+        except Exception as e:
+            print(f"  !!  {name} size={size}: {e}", file=sys.stderr)
+    print(f"  {name} local={local_id} tq={tq_id} kept={kept} downloaded={got}")
+PY
+  else
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] && continue
+      local lid tq name
+      lid="$(printf '%s' "${line}" | cut -d'|' -f1)"
+      tq="$(printf '%s' "${line}" | cut -d'|' -f2)"
+      name="$(printf '%s' "${line}" | cut -d'|' -f3-)"
+      info "portrait ${name} local=${lid} tq=${tq}"
+      download_portrait_sizes "${lid}" "${tq}" "${char_dir}"
+    done < <(python3 -c 'import json,sys
+for p in json.loads(sys.argv[1] or "[]"):
+  print("%s|%s|%s"%(p.get("localCharacterID"),p.get("tqCharacterID"),p.get("characterName") or ""))
+' "${pairs_json}" 2>/dev/null || true)
+  fi
+
+  if [[ "$(find "${char_dir}" -type f 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]]; then
+    docker run --rm \
+      -v "${volume}:/data" \
+      -v "${char_dir}:/portraits:ro" \
+      alpine sh -c '
+        mkdir -p /data/gameStore/images/Character
+        cp -a /portraits/. /data/gameStore/images/Character/
+        echo "volume Character files: $(find /data/gameStore/images/Character -type f | wc -l)"
+      '
+    ok "imported-character portraits restored into volume"
+  else
+    warn "no portrait files written — check network access to images.evetech.net"
+  fi
+}
+
 preserve_custom_tools() {
   local bak="$1"
   local t
@@ -602,10 +773,12 @@ main() {
   release:  ${SOURCE_DIR}
   project:  ${project}
   volume:   ${volume}
-  timers:   keep=${KEEP_TIMERS} skill=${SKILL_SPEED:-default} upwell=${UPWELL_SCALE:-default}
-  snapshot: ${DO_SNAPSHOT}
-  build:    ${DO_BUILD}
-  start:    ${DO_START}
+  timers:     keep=${KEEP_TIMERS} skill=${SKILL_SPEED:-default} upwell=${UPWELL_SCALE:-default}
+  snapshot:   ${DO_SNAPSHOT}
+  build:      ${DO_BUILD}
+  start:      ${DO_START}
+  portraits:  restore_imported=${RESTORE_PORTRAITS} force_download=${FORCE_PORTRAIT_DOWNLOAD}
+              (only characters with tqImport.sourceCharacterID; local-created alts skipped)
 EOF
     exit 0
   fi
@@ -700,6 +873,7 @@ Tool: ${TOOL_NAME} v${TOOL_VERSION}
 - Docker volume: ${volume}
 - Tree backup: ${bak}
 - Certs, _local/, custom tools, generated images
+- TQ-imported character faces (restored when tqImport metadata present)
 
 ## Removed by design
 - X-Eve / Living Universe server code (not in stock ${TARGET_VERSION})
@@ -744,6 +918,10 @@ EOF
       || warn "proxy health not reachable yet"
   fi
 
+  # After image exists: restore faces for TQ-imported characters only
+  # (needs better-sqlite3 image or tools/tq-import; skips pure local-created alts)
+  restore_imported_character_portraits "${volume}" "${project}"
+
   header "Done"
   cat <<EOF
   Install:   ${ROOT}
@@ -753,6 +931,9 @@ EOF
 
   Edit timers:  ${ROOT}/config/gameplay.json
   Restart:      cd ${ROOT} && docker compose restart server
+
+  Faces only (later):
+    node tools/tq-import/tq-import.js restore-portraits
 
   Rollback tree:
     docker compose -f ${ROOT}/compose.yaml down

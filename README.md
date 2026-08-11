@@ -24,6 +24,17 @@ Auto-detect zip/folder (Downloads, Desktop, cwd):
 ./tools/evejs-upgrade/upgrade-to-0.12.5.sh
 ```
 
+Portrait restore for **already-imported** characters is **on by default**.  
+Local-created alts (no TQ import metadata) are left alone.
+
+```bash
+# skip face restore
+./tools/evejs-upgrade/upgrade-to-0.12.5.sh --zip ... --skip-restore-portraits
+
+# always re-download imported faces from images.evetech.net
+./tools/evejs-upgrade/upgrade-to-0.12.5.sh --zip ... --force-portrait-download
+```
+
 ## What it does
 
 | Step | Detail |
@@ -35,7 +46,7 @@ Auto-detect zip/folder (Downloads, Desktop, cwd):
 | Preserve | Certs, `_local/`, custom tools, LAN compose, character/alliance images |
 | Volume | Reuses your existing Docker data volume (characters/accounts/market) |
 | Timers | By default keeps fast skill + structure timers if found (or 3600 / 0.01) |
-| Portraits | **Required on 0.12.5:** copies legacy `generated/Character` JPGs (incl. TQ-import faces) into the Docker volume at `gameStore/images/Character/`, and bind-mounts the legacy Character folder so character select is not blank |
+| Portraits | **Required on 0.12.5:** copies legacy `generated/Character` JPGs into the Docker volume, bind-mounts Character, then **auto-restores faces for TQ-imported characters only** (`tqImport.sourceCharacterID`). Pure local-created alts are skipped. |
 | Build/start | Rebuilds image and starts the stack |
 
 **Living Universe / X-Eve code is not in stock 0.12.5** — the upgrade removes it
@@ -54,6 +65,9 @@ by installing official release code. Your **saved characters** stay in the volum
 --skip-snapshot       Skip universe snapshot
 --skip-build          Do not docker compose build
 --skip-start          Do not start after upgrade
+--restore-portraits   Restore TQ-imported faces (default on)
+--skip-restore-portraits  Do not restore imported faces
+--force-portrait-download  Re-download faces even if host JPGs exist
 --yes                 Non-interactive
 --dry-run             Print plan only
 ```
@@ -63,6 +77,7 @@ by installing official release code. Your **saved characters** stay in the volum
 - Config lives under `config/*.json` (not `evejs.config.local.json`)
 - Timers: `config/gameplay.json` → `skills.skillTrainingSpeed`, `structures.upwellTimerScale`
 - Restart after edits: `docker compose restart server`
+- Faces only later: `node tools/tq-import/tq-import.js restore-portraits`
 - LAN (if you use dml-lan-play): re-run `lan-play.sh evejs enable` if needed
 
 ## Rollback

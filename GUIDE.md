@@ -79,7 +79,7 @@ Stock timers:
 ./tools/evejs-upgrade/upgrade-to-0.12.5.sh --zip ... --no-keep-timers
 ```
 
-## Character portraits
+## Character portraits (imported only)
 
 0.12.5 stores portraits on the **Docker volume** under:
 
@@ -93,13 +93,31 @@ Older installs kept them in:
 server/src/_secondary/image/generated/Character/
 ```
 
-The upgrade script **copies** legacy files into the volume and bind-mounts the
-legacy Character folder so nothing is left only in a disposable image layer.
+The upgrade script:
 
-If portraits are still missing after upgrade:
+1. **Copies** legacy host JPGs into the volume  
+2. Bind-mounts the legacy Character folder  
+3. **Auto-restores faces for TQ-imported characters only**  
+   - Detects `tqImport.sourceCharacterID` on the character row  
+   - Reuses host JPGs or re-downloads from `images.evetech.net`  
+   - **Skips pure local-created characters** (no import metadata)  
+
+If you also have `tools/tq-import`, the upgrade prefers:
 
 ```bash
-# from install root — host legacy → volume
+node tools/tq-import/tq-import.js restore-portraits
+```
+
+Manual face-only restore later:
+
+```bash
+node tools/tq-import/tq-import.js restore-portraits
+node tools/tq-import/tq-import.js restore-portraits --sync-only
+```
+
+If portraits are still missing:
+
+```bash
 VOL=$(docker volume ls -q | grep -E 'evejs.*data' | head -1)
 docker run --rm -v "$VOL:/data" \
   -v "$PWD/server/src/_secondary/image/generated/Character:/portraits:ro" \
